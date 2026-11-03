@@ -1,0 +1,670 @@
+# ============================================================================
+# canary-sentinel.all-in-one.txt — v1.1
+# Defensive canary honeypot: banner grab, OS/tooling fingerprint, jitter,
+# temporary quarantine, and webhook alerting. Go + Rust in one source bundle.
+#
+# AUTHORIZED USE ONLY: deploy only on systems/networks you own or are
+# authorized to monitor.
+#
+# ============================================================================
+# HOW TO RUN — GO
+# ============================================================================
+# 1. Copy the section between <<<GO_BEGIN>>> and <<<GO_END>>>
+#    into: canary-sentinel.go
+#
+# 2. Run:
+#      go run canary-sentinel.go
+#
+#    Or build:
+#      go build -o canary-sentinel canary-sentinel.go
+#      ./canary-sentinel
+#
+# 3. Configure:
+#      LISTEN_ADDR=0.0.0.0:2222 \
+#      ALERT_WEBHOOK_URL=https://your-siem-or-slack-webhook \
+#      LOG_FILE=/var/log/canary-sentinel.jsonl \
+#      RATE_LIMIT_RPM=60 \
+#      QUARANTINE_MINUTES=30 \
+#      go run canary-sentinel.go
+#
+# ============================================================================
+# HOW TO RUN — RUST
+# ============================================================================
+# 1. Create:
+#      canary-sentinel/
+#        Cargo.toml       <- copy CARGO section
+#        src/main.rs      <- copy RUST section
+#
+# 2. Run:
+#      cargo run
+#
+#    Or release build:
+#      cargo build --release
+#      ./target/release/canary-sentinel
+#
+# 3. Configure:
+#      LISTEN_ADDR=0.0.0.0:2222 \
+#      ALERT_WEBHOOK_URL=https://your-siem-or-slack-webhook \
+#      QUARANTINE_MINUTES=30 \
+#      RATE_LIMIT_RPM=60 \
+#      RUST_LOG=info \
+#      cargo run --release
+#
+# ============================================================================
+# HOW TO TEST
+# ============================================================================
+#   nc 127.0.0.1 2222
+#   Type any banner, for example:
+#     SSH-2.0-OpenSSH_9.6 Linux
+#
+# The honeypot will:
+#   - Capture the banner
+#   - Infer OS/tooling
+#   - Wait a randomized 100-500 ms jitter interval
+#   - Reply with a fake SSH banner
+#   - Log a CANARY_BANNER_CAPTURED event
+#   - Quarantine sources that exceed the rate threshold
+#
+# ============================================================================
+# CONTAINMENT MODEL
+# ============================================================================
+# - "Orphan and contain" here means: isolate the interaction, cap its lifetime
+#   with connection deadlines, and quarantine the source temporarily.
+# - The service intentionally does NOT kill or attack remote processes.
+#   Killing a malware process can cause it to respawn or trigger failover.
+# - Instead, it observes, fingerprints, rate-limits, quarantines, and alerts.
+# - Never executes client input and never provides a shell.
+#
+# ============================================================================
+# SECURITY / DEPLOYMENT
+# ============================================================================
+# - Default bind: 127.0.0.1:2222
+# - Run as an unprivileged user in a container, namespace, or systemd unit
+#   with ProtectSystem=strict, PrivateTmp=yes, NoNewPrivileges=yes.
+# - Put behind a firewall/segmentation boundary; do not expose broadly.
+# - Forward JSON logs to a SIEM and alert on CANARY_BANNER_CAPTURED and
+#   SOURCE_QUARANTINED.
+# ============================================================================
+
+<<<GO_BEGIN>>>
+// canary-sentinel.go — production-oriented defensive canary honeypot.
+// AUTHORIZED USE ONLY: deploy only on systems/networks you own or are authorized to monitor.
+//
+// HOW TO RUN (GO):
+//   go run canary-sentinel.go
+//   # or
+//   go build -o canary-sentinel canary-sentinel.go && ./canary-sentinel
+//
+// Optional configuration:
+//   LISTEN_ADDR=0.0.0.0:2222 \
+//   ALERT_WEBHOOK_URL=https://your-siem-or-slack-webhook \
+//   LOG_FILE=/var/log/canary-sentinel.jsonl \
+//   RATE_LIMIT_RPM=60 \
+//   QUARANTINE_MINUTES=30 \
+//   go run canary-sentinel.go
+//
+// Test:
+//   nc 127.0.0.1 2222
+//   # then type any banner/text; the honeypot records it and responds after jitter.
+//
+// Behavior:
+//   - Grabs the client banner and fingerprints likely OS/tooling.
+//   - Adds randomized jitter before responding.
+//   - Quarantines abusive sources for a configurable period instead of killing them.
+//   - Never executes client input and never provides a shell.
+package main
+
+import (
+	"bufio"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"math/big"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+)
+
+type Config struct {
+	ListenAddr, WebhookURL, LogFile string
+	RateLimitRPM, QuarantineMinutes int
+	MaxBannerBytes                  int
+}
+
+type Event struct {
+	Time, Level, Event, SourceIP, Banner, OS, Tooling, Action, Detail string
+}
+
+type Logger struct {
+	mu   sync.Mutex
+	file *os.File
+}
+
+func NewLogger(path string) (*Logger, error) {
+	l := &Logger{}
+	if path != "" {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			return nil, err
+		}
+		l.file = f
+	}
+	return l, nil
+}
+
+func (l *Logger) Log(e Event) {
+	e.Time = time.Now().UTC().Format(time.RFC3339Nano)
+	if e.Level == "" {
+		e.Level = "info"
+	}
+	b, _ := json.Marshal(e)
+	line := string(b)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	log.Println(line)
+	if l.file != nil {
+		l.file.WriteString(line + "\n")
+	}
+}
+
+func (l *Logger) Close() {
+	if l.file != nil {
+		l.file.Close()
+	}
+}
+
+func sendWebhook(cfg Config, e Event) {
+	if cfg.WebhookURL == "" || !strings.HasPrefix(cfg.WebhookURL, "https://") {
+		return
+	}
+	payload, _ := json.Marshal(map[string]string{
+		"text":   fmt.Sprintf("CANARY/QUARANTINE: %s from %s [%s/%s]", e.Event, e.SourceIP, e.OS, e.Tooling),
+		"source": e.SourceIP,
+		"detail": e.Banner,
+	})
+	req, err := http.NewRequest(http.MethodPost, cfg.WebhookURL, strings.NewReader(string(payload)))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err == nil {
+		resp.Body.Close()
+	}
+}
+
+func fingerprint(banner string) (osGuess, tooling string) {
+	b := strings.ToLower(banner)
+	switch {
+	case strings.Contains(b, "windows"), strings.Contains(b, "win32"), strings.Contains(b, "powershell"):
+		osGuess = "windows"
+	case strings.Contains(b, "darwin"), strings.Contains(b, "macos"):
+		osGuess = "macos"
+	case strings.Contains(b, "linux"), strings.Contains(b, "ubuntu"), strings.Contains(b, "debian"),
+		strings.Contains(b, "centos"), strings.Contains(b, "rhel"), strings.Contains(b, "alpine"):
+		osGuess = "linux"
+	case strings.Contains(b, "bsd"):
+		osGuess = "bsd"
+	default:
+		osGuess = "unknown"
+	}
+	switch {
+	case strings.Contains(b, "ssh-"), strings.Contains(b, "openssh"):
+		tooling = "ssh"
+	case strings.Contains(b, "curl/"):
+		tooling = "curl"
+	case strings.Contains(b, "wget"):
+		tooling = "wget"
+	case strings.Contains(b, "python"):
+		tooling = "python"
+	case strings.Contains(b, "nmap"):
+		tooling = "nmap"
+	case strings.Contains(b, "nc"), strings.Contains(b, "netcat"):
+		tooling = "netcat"
+	default:
+		tooling = "unknown"
+	}
+	return
+}
+
+func jitter() time.Duration {
+	n, _ := rand.Int(rand.Reader, big.NewInt(400))
+	return time.Duration(100+n.Int64()) * time.Millisecond
+}
+
+type quarantine struct {
+	mu   sync.Mutex
+	until map[string]time.Time
+}
+
+func newQuarantine() *quarantine {
+	return &quarantine{until: map[string]time.Time{}}
+}
+
+func (q *quarantine) active(ip string) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	t, ok := q.until[ip]
+	return ok && time.Now().Before(t)
+}
+
+func (q *quarantine) add(ip string, d time.Duration) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.until[ip] = time.Now().Add(d)
+}
+
+type limiter struct {
+	mu      sync.Mutex
+	entries map[string][]time.Time
+	rpm     int
+}
+
+func newLimiter(rpm int) *limiter {
+	return &limiter{entries: map[string][]time.Time{}, rpm: rpm}
+}
+
+func (l *limiter) allow(ip string) bool {
+	now := time.Now()
+	cutoff := now.Add(-time.Minute)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	kept := l.entries[ip][:0]
+	for _, t := range l.entries[ip] {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) >= l.rpm {
+		l.entries[ip] = kept
+		return false
+	}
+	l.entries[ip] = append(kept, now)
+	return true
+}
+
+type server struct {
+	cfg        Config
+	logger     *Logger
+	q          *quarantine
+	limiter    *limiter
+}
+
+func (s *server) handle(conn net.Conn) {
+	defer conn.Close()
+	ip := ""
+	if host, _, err := net.SplitHostPort(conn.RemoteAddr().String()); err == nil {
+		ip = host
+	}
+
+	if s.q.active(ip) {
+		s.logger.Log(Event{Level: "warn", Event: "quarantined_connection", SourceIP: ip, Action: "contained_no_kill"})
+		return
+	}
+	if !s.limiter.allow(ip) {
+		s.q.add(ip, time.Duration(s.cfg.QuarantineMinutes)*time.Minute)
+		e := Event{Level: "critical", Event: "SOURCE_QUARANTINED", SourceIP: ip, Action: "contained_not_killed", Detail: "rate threshold exceeded"}
+		s.logger.Log(e)
+		go sendWebhook(s.cfg, e)
+		return
+	}
+
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	reader := bufio.NewReader(conn)
+	bannerBytes := make([]byte, 0, s.cfg.MaxBannerBytes)
+	buf := make([]byte, 1024)
+	for len(bannerBytes) < s.cfg.MaxBannerBytes {
+		n, err := reader.Read(buf)
+		if n > 0 {
+			bannerBytes = append(bannerBytes, buf[:n]...)
+			if strings.Contains(string(bannerBytes), "\n") {
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	banner := strings.ReplaceAll(string(bannerBytes), "\n", " ")
+	banner = strings.TrimSpace(banner)
+	if len(banner) > 512 {
+		banner = banner[:512]
+	}
+	osGuess, tooling := fingerprint(banner)
+
+	e := Event{
+		Level: "critical", Event: "CANARY_BANNER_CAPTURED", SourceIP: ip,
+		Banner: banner, OS: osGuess, Tooling: tooling,
+		Action: "observed_and_contained", Detail: "no command execution; connection isolated by timeout",
+	}
+	s.logger.Log(e)
+	go sendWebhook(s.cfg, e)
+
+	time.Sleep(jitter())
+	conn.Write([]byte("SSH-2.0-OpenSSH_8.9p1\r\n"))
+}
+
+func env(k, fallback string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func main() {
+	cfg := Config{
+		ListenAddr:        env("LISTEN_ADDR", "127.0.0.1:2222"),
+		WebhookURL:        os.Getenv("ALERT_WEBHOOK_URL"),
+		LogFile:           os.Getenv("LOG_FILE"),
+		RateLimitRPM:      60,
+		QuarantineMinutes: 30,
+		MaxBannerBytes:    2048,
+	}
+	if v := os.Getenv("RATE_LIMIT_RPM"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.RateLimitRPM)
+	}
+	if v := os.Getenv("QUARANTINE_MINUTES"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.QuarantineMinutes)
+	}
+	if cfg.RateLimitRPM <= 0 {
+		cfg.RateLimitRPM = 60
+	}
+	if cfg.QuarantineMinutes <= 0 {
+		cfg.QuarantineMinutes = 30
+	}
+
+	logger, err := NewLogger(cfg.LogFile)
+	if err != nil {
+		log.Fatalf("log setup failed: %v", err)
+	}
+	defer logger.Close()
+
+	srv := &server{cfg: cfg, logger: logger, q: newQuarantine(), limiter: newLimiter(cfg.RateLimitRPM)}
+
+	listener, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		log.Fatalf("listen failed: %v", err)
+	}
+	logger.Log(Event{Event: "started", Detail: cfg.ListenAddr, Action: "banner_grab_os_fingerprint_jitter_quarantine"})
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-stop
+		listener.Close()
+	}()
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				break
+			}
+			logger.Log(Event{Level: "warn", Event: "accept_error", Detail: err.Error()})
+			continue
+		}
+		go srv.handle(conn)
+	}
+	logger.Log(Event{Event: "stopped"})
+}
+
+<<<GO_END>>>
+
+<<<RUST_BEGIN>>>
+// src/main.rs — canary-sentinel (Rust / Tokio)
+// AUTHORIZED USE ONLY: deploy only on systems/networks you own or are authorized to monitor.
+//
+// HOW TO RUN (RUST):
+//   cargo run
+//   # or
+//   cargo build --release && ./target/release/canary-sentinel
+//
+// Optional configuration:
+//   LISTEN_ADDR=0.0.0.0:2222 \
+//   ALERT_WEBHOOK_URL=https://your-siem-or-slack-webhook \
+//   RUST_LOG=info \
+//   cargo run --release
+//
+// Test:
+//   nc 127.0.0.1 2222
+//
+// Behavior:
+//   - Grabs client banner and fingerprints likely OS/tooling.
+//   - Adds randomized jitter before responding.
+//   - Quarantines rate-limit offenders temporarily; does not kill processes.
+//   - Never executes client input and never provides a shell.
+use chrono::Utc;
+use rand::Rng;
+use serde::Serialize;
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    time::timeout,
+};
+use tracing::{error, info, warn};
+
+#[derive(Clone)]
+struct AppState {
+    webhook: Option<String>,
+    quarantine_minutes: u64,
+    rpm: usize,
+    quarantine: Arc<Mutex<HashMap<String, std::time::Instant>>>,
+    hits: Arc<Mutex<HashMap<String, Vec<std::time::Instant>>>>,
+}
+
+#[derive(Serialize)]
+struct Event {
+    time: String,
+    level: &'static str,
+    event: &'static str,
+    source_ip: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    banner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    os: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tooling: Option<String>,
+    action: &'static str,
+}
+
+fn fingerprint(banner: &str) -> (String, String) {
+    let b = banner.to_lowercase();
+    let os = if b.contains("windows") || b.contains("powershell") {
+        "windows"
+    } else if b.contains("darwin") || b.contains("macos") {
+        "macos"
+    } else if b.contains("linux") || b.contains("ubuntu") || b.contains("debian") {
+        "linux"
+    } else if b.contains("bsd") {
+        "bsd"
+    } else {
+        "unknown"
+    };
+    let tooling = if b.contains("ssh-") || b.contains("openssh") {
+        "ssh"
+    } else if b.contains("curl/") {
+        "curl"
+    } else if b.contains("wget") {
+        "wget"
+    } else if b.contains("python") {
+        "python"
+    } else if b.contains("nmap") {
+        "nmap"
+    } else {
+        "unknown"
+    };
+    (os.into(), tooling.into())
+}
+
+async fn send_webhook(url: &str, e: &Event) {
+    let payload = serde_json::json!({
+        "text": format!("{} from {} [{} / {}]", e.event, e.source_ip,
+            e.os.as_deref().unwrap_or("unknown"),
+            e.tooling.as_deref().unwrap_or("unknown")),
+        "source": e.source_ip,
+    });
+    if let Err(err) = reqwest::Client::new()
+        .post(url)
+        .json(&payload)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
+        error!(error = %err, "webhook delivery failed");
+    }
+}
+
+async fn handle(mut stream: TcpStream, state: AppState) {
+    let peer = match stream.peer_addr() {
+        Ok(a) => a.ip().to_string(),
+        Err(_) => return,
+    };
+
+    let now = std::time::Instant::now();
+
+    {
+        let q = state.quarantine.lock().unwrap();
+        if let Some(until) = q.get(&peer) {
+            if now < *until {
+                warn!(event = "quarantined_connection", source_ip = %peer, action = "contained_no_kill");
+                return;
+            }
+        }
+    }
+
+    {
+        let mut hits = state.hits.lock().unwrap();
+        let recent = hits.entry(peer.clone()).or_default();
+        recent.retain(|t| now.duration_since(*t) < Duration::from_secs(60));
+        if recent.len() >= state.rpm {
+            let until = now + Duration::from_secs(state.quarantine_minutes * 60);
+            drop(hits);
+            state.quarantine.lock().unwrap().insert(peer.clone(), until);
+            let e = Event {
+                time: Utc::now().to_rfc3339(),
+                level: "critical",
+                event: "SOURCE_QUARANTINED",
+                source_ip: peer.clone(),
+                banner: None,
+                os: None,
+                tooling: None,
+                action: "contained_not_killed",
+            };
+            error!(?e, "source quarantined after rate threshold");
+            if let Some(url) = state.webhook.clone() {
+                tokio::spawn(async move { send_webhook(&url, &e).await });
+            }
+            return;
+        }
+        recent.push(now);
+    }
+
+    let mut banner = Vec::new();
+    let mut buf = [0u8; 1024];
+    if let Ok(Ok(n)) = timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
+        if n > 0 {
+            banner.extend_from_slice(&buf[..n.min(2048)]);
+        }
+    }
+    let banner = String::from_utf8_lossy(&banner).replace('\n', " ");
+    let banner = banner.trim().chars().take(512).collect::<String>();
+    let (os, tooling) = fingerprint(&banner);
+
+    let e = Event {
+        time: Utc::now().to_rfc3339(),
+        level: "critical",
+        event: "CANARY_BANNER_CAPTURED",
+        source_ip: peer.clone(),
+        banner: Some(banner.clone()),
+        os: Some(os.clone()),
+        tooling: Some(tooling.clone()),
+        action: "observed_and_contained",
+    };
+    error!(?e, "banner captured; no command execution; connection isolated by timeout");
+    if let Some(url) = state.webhook.clone() {
+        let e2 = e.clone();
+        tokio::spawn(async move { send_webhook(&url, &e2).await });
+    }
+
+    let jitter_ms = rand::thread_rng().gen_range(100..500);
+    tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+    let _ = stream.write_all(b"SSH-2.0-OpenSSH_8.9p1\r\n").await;
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().json().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+    ).init();
+
+    let listen_addr: SocketAddr = std::env::var("LISTEN_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:2222".into())
+        .parse()
+        .expect("invalid LISTEN_ADDR");
+    let webhook = std::env::var("ALERT_WEBHOOK_URL").ok();
+    let quarantine_minutes: u64 = std::env::var("QUARANTINE_MINUTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let rpm: usize = std::env::var("RATE_LIMIT_RPM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+
+    let state = AppState {
+        webhook,
+        quarantine_minutes,
+        rpm,
+        quarantine: Arc::new(Mutex::new(HashMap::new())),
+        hits: Arc::new(Mutex::new(HashMap::new())),
+    };
+
+    info!(
+        listen = %listen_addr,
+        features = "banner_grab,os_fingerprint,jitter,quarantine",
+        "canary-sentinel started"
+    );
+
+    let listener = TcpListener::bind(listen_addr).await.unwrap();
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        let state = state.clone();
+        tokio::spawn(handle(stream, state));
+    }
+}
+
+<<<RUST_END>>>
+
+<<<CARGO_BEGIN>>>
+# Cargo.toml — place beside src/main.rs.
+[package]
+name = "canary-sentinel"
+version = "1.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+<<<CARGO_END>>>
