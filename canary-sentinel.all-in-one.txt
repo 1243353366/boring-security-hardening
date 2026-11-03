@@ -1,0 +1,405 @@
+# canary-sentinel.all-in-one.txt
+# Defensive canary honeypot — Go and Rust implementations in one file.
+# AUTHORIZED USE ONLY: deploy only on systems/networks you own or are authorized to monitor.
+#
+# Extract each marked section into its own file before building:
+#   GO:   canary-sentinel.go
+#   RUST: src/main.rs
+#   RUST: Cargo.toml
+#
+# Go:   go run canary-sentinel.go
+# Rust: cargo run --release
+
+<<<GO_BEGIN>>>
+// canary-sentinel.go — production-grade defensive canary honeypot.
+// AUTHORIZED USE ONLY: deploy only on systems/networks you own or are authorized to monitor.
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+)
+
+type Config struct {
+	ListenAddr, WebhookURL, LogFile string
+	RateLimitRPM                    int
+	DecoyPath, CanaryPrefix         string
+}
+
+type Event struct {
+	Time, Level, Event, Token, SourceIP, Method, Path, UserAgent, Detail string
+}
+
+type Logger struct {
+	mu   sync.Mutex
+	file *os.File
+}
+
+func NewLogger(path string) (*Logger, error) {
+	l := &Logger{}
+	if path != "" {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			return nil, err
+		}
+		l.file = f
+	}
+	return l, nil
+}
+
+func (l *Logger) Log(e Event) {
+	e.Time = time.Now().UTC().Format(time.RFC3339Nano)
+	if e.Level == "" {
+		e.Level = "info"
+	}
+	b, _ := json.Marshal(e)
+	line := string(b)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	log.Println(line)
+	if l.file != nil {
+		l.file.WriteString(line + "\n")
+	}
+}
+
+func (l *Logger) Close() {
+	if l.file != nil {
+		l.file.Close()
+	}
+}
+
+func sendWebhook(cfg Config, e Event) {
+	if cfg.WebhookURL == "" || !strings.HasPrefix(cfg.WebhookURL, "https://") {
+		return
+	}
+	payload, _ := json.Marshal(map[string]string{
+		"text":   fmt.Sprintf("CANARY TRIGGERED: token %s from %s accessed %s", e.Token, e.SourceIP, e.Path),
+		"token":  e.Token,
+		"source": e.SourceIP,
+	})
+	req, err := http.NewRequest(http.MethodPost, cfg.WebhookURL, strings.NewReader(string(payload)))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err == nil {
+		resp.Body.Close()
+	}
+}
+
+func newToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+type limiter struct {
+	mu      sync.Mutex
+	entries map[string][]time.Time
+	rpm     int
+}
+
+func newLimiter(rpm int) *limiter {
+	return &limiter{entries: map[string][]time.Time{}, rpm: rpm}
+}
+
+func (l *limiter) allow(ip string) bool {
+	now := time.Now()
+	cutoff := now.Add(-time.Minute)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	kept := l.entries[ip][:0]
+	for _, t := range l.entries[ip] {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) >= l.rpm {
+		l.entries[ip] = kept
+		return false
+	}
+	l.entries[ip] = append(kept, now)
+	return true
+}
+
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Content-Security-Policy", "default-src 'none'")
+		h.Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
+}
+
+type server struct {
+	cfg     Config
+	logger  *Logger
+	token   string
+	limiter *limiter
+}
+
+func (s *server) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok\n")) })
+	mux.HandleFunc(s.cfg.DecoyPath, s.decoy)
+	mux.HandleFunc(s.cfg.CanaryPrefix, s.canary)
+	return securityHeaders(mux)
+}
+
+func (s *server) decoy(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	if !s.limiter.allow(ip) {
+		s.logger.Log(Event{Level: "warn", Event: "rate_limited", SourceIP: ip, Path: r.URL.Path})
+		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		return
+	}
+	s.logger.Log(Event{Event: "decoy_accessed", SourceIP: ip, Method: r.Method, Path: r.URL.Path, UserAgent: r.UserAgent()})
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprintf(w, "INTERNAL USE ONLY\n\nDatabase backup recovery instructions:\nRecovery URL: http://%s%s%s\n", s.cfg.ListenAddr, s.cfg.CanaryPrefix, s.token)
+}
+
+func (s *server) canary(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	if !s.limiter.allow(ip) {
+		s.logger.Log(Event{Level: "warn", Event: "rate_limited", SourceIP: ip, Path: r.URL.Path})
+		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		return
+	}
+	supplied := strings.TrimPrefix(r.URL.Path, s.cfg.CanaryPrefix)
+	if subtle.ConstantTimeCompare([]byte(supplied), []byte(s.token)) != 1 {
+		s.logger.Log(Event{Level: "warn", Event: "invalid_canary", SourceIP: ip, Path: r.URL.Path})
+		http.NotFound(w, r)
+		return
+	}
+	e := Event{Level: "critical", Event: "CANARY_TRIGGERED", Token: s.token, SourceIP: ip, Method: r.Method, Path: r.URL.Path, UserAgent: r.UserAgent(), Detail: "Unauthorized access to deception artifact"}
+	s.logger.Log(e)
+	go sendWebhook(s.cfg, e)
+	http.NotFound(w, r)
+}
+
+func env(k, fallback string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func main() {
+	cfg := Config{
+		ListenAddr:   env("LISTEN_ADDR", "127.0.0.1:8080"),
+		WebhookURL:   os.Getenv("ALERT_WEBHOOK_URL"),
+		LogFile:      os.Getenv("LOG_FILE"),
+		RateLimitRPM: 60,
+		DecoyPath:    env("DECOY_PATH", "/decoy/backup_credentials.txt"),
+		CanaryPrefix: env("CANARY_PATH_PREFIX", "/canary/"),
+	}
+	if v := os.Getenv("RATE_LIMIT_RPM"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.RateLimitRPM)
+	}
+	if cfg.RateLimitRPM <= 0 {
+		cfg.RateLimitRPM = 60
+	}
+	logger, err := NewLogger(cfg.LogFile)
+	if err != nil {
+		log.Fatalf("log setup failed: %v", err)
+	}
+	defer logger.Close()
+	token, err := newToken()
+	if err != nil {
+		log.Fatalf("token generation failed: %v", err)
+	}
+	srv := &server{cfg: cfg, logger: logger, token: token, limiter: newLimiter(cfg.RateLimitRPM)}
+	httpSrv := &http.Server{
+		Addr: cfg.ListenAddr, Handler: srv.routes(),
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
+		WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 8192,
+	}
+	logger.Log(Event{Event: "started", Detail: cfg.ListenAddr, Token: token})
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+	<-stop
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := httpSrv.Shutdown(ctx); err != nil {
+		log.Printf("shutdown error: %v", err)
+	}
+	logger.Log(Event{Event: "stopped"})
+}
+
+<<<GO_END>>>
+
+<<<RUST_BEGIN>>>
+// src/main.rs — canary-sentinel (Rust / Axum)
+// AUTHORIZED USE ONLY: deploy only on systems/networks you own or are authorized to monitor.
+use axum::{
+    extract::{Path, State},
+    http::{header, HeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::get,
+    Router,
+};
+use chrono::Utc;
+use rand::RngCore;
+use serde::Serialize;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
+use tower_http::{limit::RequestBodyLimitLayer, timeout::TimeoutLayer};
+use tracing::{error, info, warn};
+
+#[derive(Clone)]
+struct AppState {
+    token: Arc<String>,
+    webhook: Option<String>,
+}
+
+#[derive(Serialize)]
+struct Event {
+    time: String,
+    level: &'static str,
+    event: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    source_ip: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_agent: Option<String>,
+}
+
+fn client_ip(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+async fn health() -> &'static str {
+    "ok\n"
+}
+
+async fn decoy(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let ip = client_ip(&headers);
+    info!(event = "decoy_accessed", source_ip = %ip, "decoy downloaded");
+    let body = format!(
+        "INTERNAL USE ONLY\n\nDatabase backup recovery instructions:\nRecovery URL: http://127.0.0.1:8080/canary/{}\n",
+        state.token
+    );
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body)
+}
+
+async fn canary(
+    State(state): State<AppState>,
+    Path(supplied): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let ip = client_ip(&headers);
+    if supplied != *state.token {
+        warn!(event = "invalid_canary", source_ip = %ip, "invalid canary token");
+        return (StatusCode::NOT_FOUND, "Not found\n").into_response();
+    }
+    let event = Event {
+        time: Utc::now().to_rfc3339(),
+        level: "critical",
+        event: "CANARY_TRIGGERED",
+        token: Some((*state.token).clone()),
+        source_ip: ip.clone(),
+        user_agent: headers.get("user-agent").and_then(|v| v.to_str().ok()).map(String::from),
+    };
+    error!(?event, "CANARY_TRIGGERED unauthorized access to deception artifact");
+    if let Some(url) = state.webhook.clone() {
+        let payload = serde_json::json!({
+            "text": format!("CANARY TRIGGERED from {ip}"),
+            "token": *state.token,
+            "source": ip,
+        });
+        tokio::spawn(async move {
+            if let Err(e) = reqwest::Client::new().post(&url).json(&payload).timeout(Duration::from_secs(5)).send().await {
+                error!(error = %e, "webhook delivery failed");
+            }
+        });
+    }
+    (StatusCode::NOT_FOUND, "Not found\n").into_response()
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().json().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+    ).init();
+
+    let listen_addr: SocketAddr = std::env::var("LISTEN_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:8080".into())
+        .parse()
+        .expect("invalid LISTEN_ADDR");
+    let webhook = std::env::var("ALERT_WEBHOOK_URL").ok();
+
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let token = Arc::new(bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    let state = AppState { token: token.clone(), webhook };
+
+    let app = Router::new()
+        .route("/healthz", get(health))
+        .route("/decoy/backup_credentials.txt", get(decoy))
+        .route("/canary/:id", get(canary))
+        .layer(RequestBodyLimitLayer::new(8 * 1024))
+        .layer(TimeoutLayer::new(Duration::from_secs(10)))
+        .with_state(state);
+
+    info!(listen = %listen_addr, token = %*token, "canary-sentinel started");
+    let listener = tokio::net::TcpListener::bind(listen_addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+<<<RUST_END>>>
+
+<<<CARGO_BEGIN>>>
+[package]
+name = "canary-sentinel"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["limit-request", "timeout"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+<<<CARGO_END>>>
