@@ -10,6 +10,7 @@ The premise is simple: real-world incidents rarely require broken cryptography. 
 - [Incident response playbook](docs/incident-response.md) — work backward from impact and evidence to cause, scope, and containment.
 - [Evidence and timeline worksheet](docs/evidence-and-timeline.md) — record what changed without overclaiming.
 - [Wireless incident checklist](docs/wireless-incident-checklist.md) — investigate suspicious Wi-Fi access by identity and artifacts, not by guessing which gadget was used.
+- [Wireless observations and false positives](docs/wireless-observations.md) — understand what nearby radio observations can and cannot establish.
 - [Security policy](SECURITY.md) — scope, safe use, and how to report a problem in this project.
 
 ## The defensive question
