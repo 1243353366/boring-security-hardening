@@ -51,3 +51,7 @@ This is general defensive guidance, not a substitute for vendor documentation, l
 ## Contributing
 
 Contributions should be actionable, defensive, vendor-neutral where possible, and clear about assumptions. Do not include live credentials, personal data, exploit payloads, or instructions for unauthorized access. See [SECURITY.md](SECURITY.md).
+
+---
+
+Thanks for reading. More of my work: [github.com/1243353366](https://github.com/1243353366).
